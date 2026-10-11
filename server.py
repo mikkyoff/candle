@@ -1,25 +1,16 @@
 """
-Time-aligned 15-second candle stream for EURCHF_otc.
+Time-aligned candle stream for EURCHF_otc.
 
-Two distinct phases:
+Seeds with compile_candles (15s bars don't exist natively on the server),
+then streams with subscribe_symbol_timed, which is the library's
+time-aligned subscription path.
 
-  1. Seed: compile 15s candles from tick history via
-     client.compile_candles(asset, 15, lookback_seconds).
-     PocketOption does not serve 15s candles natively, so these are
-     aggregated from raw 1-second ticks by the library.
-
-  2. Stream: subscribe with SubscriptionType::time_aligned(15s).
-     The library aggregates ticks internally and yields a CLOSED
-     candle at each 15-second boundary of the day (:00, :15, :30, :45).
-
-There is no "forming candle" — time-aligned gives you closed bars only.
-The newest bar on the chart appears when its window closes.
-
-If the stream drops and reconnects, the seed is re-run and any candles
-between the last we held and the first new one are compiled from ticks.
+Time-aligned candles close on 15-second boundaries of the day:
+:00, :15, :30, :45. The stream yields CLOSED candles only.
 """
 
 import asyncio
+import datetime
 import os
 import threading
 import time
@@ -31,11 +22,11 @@ SEED_TIMEOUT_S = float(os.getenv("SEED_TIMEOUT_S", "30"))
 SSID = os.getenv("POCKET_OPTION_SSID")
 
 _state = {
-    "candles": [],          # list[dict], oldest first, closed only
+    "candles": [],
     "connected": False,
     "error": None,
     "seeded": False,
-    "ticks": 0,             # counts closed candles received from the stream
+    "ticks": 0,
     "last_tick_ts": 0.0,
     "started_at": time.time(),
     "gaps_patched": 0,
@@ -50,7 +41,6 @@ _stop = threading.Event()
 
 
 def _normalize(c):
-    """Coerce a library candle into the shape Lightweight Charts wants."""
     return {
         "time": int(c["time"]),
         "open": float(c["open"]),
@@ -72,7 +62,6 @@ def _dedupe_sorted(candles):
 
 
 def _count_gaps(candles):
-    """Count missing buckets in a closed-candle series."""
     if len(candles) < 2:
         return 0
     gaps = 0
@@ -84,13 +73,6 @@ def _count_gaps(candles):
 
 
 async def _compile_window(client, lookback_seconds):
-    """
-    Ask the library to compile 15s candles from tick history.
-
-    compile_candles(asset, custom_period, lookback_period) fetches raw
-    ticks over `lookback_period` seconds and aggregates them into
-    `custom_period`-second buckets aligned to UTC boundaries.
-    """
     try:
         raw = await asyncio.wait_for(
             client.compile_candles(ASSET, TIMEFRAME, lookback_seconds),
@@ -109,9 +91,6 @@ async def _compile_window(client, lookback_seconds):
 
 
 async def _seed(client):
-    """
-    Compile the initial SEED_CANDLES of 15s candles.
-    """
     lookback = SEED_CANDLES * TIMEFRAME
     candles = await _compile_window(client, lookback)
 
@@ -125,19 +104,10 @@ async def _seed(client):
 
 
 async def _fetch_gap(client, from_time, to_time):
-    """
-    Compile candles strictly between two known-good edges.
-
-    compile_candles returns candles aligned to UTC boundaries over a
-    window ending now. We compute how far back to look from `to_time`,
-    then filter to the open interval (from_time, to_time).
-    """
     span = to_time - from_time
     if span <= 0:
         return []
 
-    # How long ago was `to_time` relative to now? Extend the lookback so
-    # the window we request covers from_time..to_time with margin.
     now = int(time.time())
     lookback = (now - from_time) + TIMEFRAME
 
@@ -161,7 +131,7 @@ async def _fetch_gap(client, from_time, to_time):
 async def _stream():
     from BinaryOptionsToolsV2 import PocketOptionAsync
     from BinaryOptionsToolsV2.config import Config
-    from BinaryOptionsToolsV2 import SubscriptionType
+
     if not SSID:
         raise RuntimeError("POCKET_OPTION_SSID is not set")
 
@@ -183,7 +153,6 @@ async def _stream():
 
     while not _stop.is_set():
         try:
-            # --- Seed ---
             seeded, source = await _seed(client)
             with _lock:
                 _state["candles"] = seeded
@@ -194,11 +163,11 @@ async def _stream():
             if not seeded:
                 raise RuntimeError("seed produced zero candles")
 
-            # --- Subscribe, time-aligned ---
-            sub_type = SubscriptionType.time_aligned(
-                __import__("datetime").timedelta(seconds=TIMEFRAME)
-            )
-            stream = await client.subscribe(ASSET, sub_type)
+            # Time-aligned subscription. subscribe_symbol_timed takes a
+            # Python timedelta and returns closed candles aligned to
+            # :00/:15/:30/:45 boundaries.
+            delta = datetime.timedelta(seconds=TIMEFRAME)
+            stream = await client.subscribe_symbol_timed(ASSET, delta)
 
             async for candle in stream:
                 if _stop.is_set():
@@ -211,16 +180,12 @@ async def _stream():
 
                 with _lock:
                     last = _state["candles"][-1] if _state["candles"] else None
-                    if last and new_candle["time"] <= last["time"]:
-                        # Duplicate or out-of-order; skip.
-                        pass
-                    elif last and new_candle["time"] - last["time"] > TIMEFRAME:
-                        # Seam: the stream resumed after a gap.
-                        # Patch outside the lock.
-                        gap_from, gap_to = last["time"], new_candle["time"]
-                        need_patch = True
-                    else:
-                        need_patch = False
+                    need_patch = (
+                        last is not None
+                        and new_candle["time"] - last["time"] > TIMEFRAME
+                    )
+                    gap_from = last["time"] if need_patch else None
+                    gap_to = new_candle["time"]
 
                 if need_patch:
                     patch = await _fetch_gap(client, gap_from, gap_to)
@@ -313,7 +278,7 @@ def snapshot():
             "seed_source": _state["seed_source"],
             "error": _state["error"],
             "candles": list(_state["candles"]),
-            "forming": None,  # time-aligned has no forming candle
+            "forming": None,
             "ticks": _state["ticks"],
             "gaps_patched": _state["gaps_patched"],
             "gaps_remaining": _state["gaps_remaining"],
