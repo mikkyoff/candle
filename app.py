@@ -22,9 +22,9 @@ def index():
 def candles():
     snap = server.snapshot()
 
-    if snap["error"] and not snap["forming"] and not snap["candles"]:
+    if snap["error"] and not snap["candles"] and not snap["forming"]:
         return jsonify(snap), 503
-    if not snap["forming"] and not snap["candles"]:
+    if not snap["candles"] and not snap["forming"]:
         return jsonify(snap), 503
 
     return jsonify(snap)
