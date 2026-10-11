@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EURJPY_otc — 1m Live Chart</title>
+<title>EURCHF_otc — 15s Live Chart</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   * { box-sizing: border-box; }
@@ -37,7 +37,7 @@
 <body>
 
 <div id="header">
-  <div class="title">EURJPY_otc — 1m Live Chart</div>
+  <div class="title">EURCHF_otc — 15s Live Chart</div>
   <div id="status"><span class="badge warn">Connecting...</span></div>
 </div>
 
@@ -70,8 +70,6 @@
 </div>
 
 <script>
-// ---- Indicator math — mirrors the "pure python, no numpy" versions ----
-
 function computeRSI(closes, period = 14) {
   if (closes.length < period + 1) return null;
   let gains = 0, losses = 0;
@@ -112,15 +110,13 @@ function computeEMA(closes, period = 6) {
   return ema;
 }
 
-// ---- Chart setup ----
-
 const chartContainer = document.getElementById("chart");
 const statusEl = document.getElementById("status");
 
 const chart = LightweightCharts.createChart(chartContainer, {
   layout: { background: { color: "#0d1017" }, textColor: "#d1d4dc" },
   grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
-  timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2a2e39" },
+  timeScale: { timeVisible: true, secondsVisible: true, borderColor: "#2a2e39" },
   rightPriceScale: { borderColor: "#2a2e39" },
 });
 
@@ -134,14 +130,11 @@ const bbLowerSeries = chart.addLineSeries({ color: "#2962ff", lineWidth: 1, pric
 const emaSeries = chart.addLineSeries({ color: "#e91e63", lineWidth: 2, priceLineVisible: false });
 
 let initialFit = false;
-
-const fmt = (n, d = 3) => (n == null || isNaN(n)) ? "—" : Number(n).toFixed(d);
+const fmt = (n, d = 5) => (n == null || isNaN(n)) ? "—" : Number(n).toFixed(d);
 
 function buildIndicatorLines(candles) {
   const closes = candles.map(c => c.close);
   const bbU = [], bbM = [], bbL = [], ema = [];
-  let e = null;
-
   for (let i = 0; i < candles.length; i++) {
     const slice = closes.slice(0, i + 1);
     const [u, m, l] = computeBollinger(slice);
@@ -165,23 +158,23 @@ async function tick() {
     const res = await fetch("/api/candles", { cache: "no-store" });
     const snap = await res.json();
 
-    if (snap.error && !snap.seeded) {
+    if (snap.error && !snap.candles.length) {
       setStatus("err", `ERROR: ${snap.error}`);
       return;
     }
-    if (!snap.seeded) {
-      setStatus("warn", `SEEDING... (${snap.candles.length} candles)`);
+    if (!snap.candles.length) {
+      setStatus("warn", "WARMING UP — waiting for first 15s bar");
       return;
     }
     if (!snap.connected) {
       setStatus("warn", "DISCONNECTED — reconnecting");
     } else {
       const age = snap.last_tick_age_s != null ? `${snap.last_tick_age_s}s` : "—";
-      setStatus("ok", `LIVE · ${snap.candles.length} candles · last tick ${age}`);
+      const gaps = snap.gaps_remaining > 0 ? ` · gaps ${snap.gaps_remaining}` : "";
+      setStatus("ok", `LIVE · ${snap.candles.length} bars · last bar ${age}${gaps}`);
     }
 
     const candles = snap.candles;
-    if (!candles.length) return;
 
     candleSeries.setData(candles);
 
@@ -191,13 +184,11 @@ async function tick() {
     bbLowerSeries.setData(lines.bbL);
     emaSeries.setData(lines.ema);
 
-    if (snap.forming) {
-      candleSeries.update(snap.forming);
-    }
-
-    if (!initialFit) {
+    if (!initialFit && candles.length >= 2) {
       chart.timeScale().fitContent();
       initialFit = true;
+    } else if (initialFit) {
+      chart.timeScale().scrollToRealTime();
     }
 
     const closes = candles.map(c => c.close);
