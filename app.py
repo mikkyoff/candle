@@ -1,13 +1,3 @@
-"""
-HTTP surface. Two routes:
-
-  GET /              → the chart page
-  GET /api/candles   → JSON snapshot of the live series
-
-The worker thread is kicked off lazily on the first request so
-cold-start errors surface as a JSON 503 rather than a silent hang.
-"""
-
 import os
 from flask import Flask, jsonify, render_template
 from flask_cors import CORS
@@ -32,14 +22,18 @@ def index():
 def candles():
     snap = server.snapshot()
 
-    # Still waiting on first seed or errored out — tell the client
-    # so it can show an honest status instead of "no data".
-    if snap["error"] and not snap["seeded"]:
+    if snap["error"] and not snap["candles"]:
         return jsonify(snap), 503
-    if not snap["seeded"]:
+    if not snap["candles"]:
+        # Not an error — just waiting for the first 15s bar to close.
         return jsonify(snap), 503
 
     return jsonify(snap)
+
+
+@app.route("/api/debug/state")
+def debug_state():
+    return jsonify(server.snapshot())
 
 
 if __name__ == "__main__":
