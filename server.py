@@ -1,19 +1,22 @@
 """
-Live 15s candles for EURCHF_otc, built from raw ticks.
+EURCHF_otc — 1 minute candles.
 
-subscribe_symbol(asset) yields raw price updates. We bucket them into
-15s candles ourselves, so:
+Two phases, per the developer's 1000candles.py example:
 
-  - the forming candle updates in real time (no waiting for close),
-  - bucket boundaries are ours (:00/:15/:30/:45 of the wall clock),
-  - a closed candle is emitted the instant a tick lands in the next bucket.
+  1. Seed: subscribe_symbol() to open the history gate, wait 5s for it
+     to open, then paginate get_candles_advanced() backward in pages of
+     PAGE_SIZE candles. Small pages, no timeout wrapper, exact count.
 
-Time alignment:
-  bucket_start(t) = (t // 15) * 15
+  2. Stream: subscribe_symbol() ticks, bucketed into 60s candles by us.
+     The forming candle updates in real time; a closed candle is
+     emitted the instant a tick lands in the next minute bucket.
 
-The chart receives both:
-  - `candles` : the closed series (immutable once written)
-  - `forming` : the current in-progress candle, updated on every tick
+Bucket boundary:
+    bucket(t) = (t // 60) * 60
+
+The chart receives:
+    candles : closed series, oldest first
+    forming : the current in-progress 1m candle, updated per tick
 """
 
 import asyncio
@@ -22,20 +25,24 @@ import threading
 import time
 
 ASSET = os.getenv("ASSET", "EURCHF_otc")
-TIMEFRAME = int(os.getenv("TIMEFRAME", "15"))
-MAX_CANDLES = int(os.getenv("MAX_CANDLES", "150"))
+TIMEFRAME = int(os.getenv("TIMEFRAME", "60"))
+SEED_CANDLES = int(os.getenv("SEED_CANDLES", "150"))
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "50"))
+MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
+WARMUP_S = float(os.getenv("WARMUP_S", "5"))
 SSID = os.getenv("POCKET_OPTION_SSID")
 
 _state = {
-    "candles": [],           # closed only, oldest first
-    "forming": None,         # dict | None
+    "candles": [],
+    "forming": None,
     "connected": False,
     "error": None,
+    "seeded": False,
+    "seed_count": 0,
     "ticks": 0,
     "last_tick_ts": 0.0,
     "started_at": time.time(),
     "gaps_remaining": 0,
-    "last_raw_tick": None,   # for debugging
 }
 _lock = threading.Lock()
 
@@ -44,22 +51,36 @@ _task = None
 _stop = threading.Event()
 
 
-def _extract_tick(tick):
-    """
-    Pull (timestamp_seconds, price) out of a raw tick dict.
+def _extract_ts(c):
+    ts = c.get("time")
+    if ts is None:
+        ts = c.get("timestamp")
+    if ts is None:
+        raise KeyError("candle has neither 'time' nor 'timestamp'")
+    ts = int(float(ts))
+    if ts > 10_000_000_000:
+        ts //= 1000
+    return ts
 
-    Different code paths in the library serialize the time field
-    differently ('time' vs 'timestamp') and the price field
-    differently ('close' vs 'price'). Accept any combination.
-    """
+
+def _normalize(c):
+    return {
+        "time": _extract_ts(c),
+        "open": float(c["open"]),
+        "high": float(c["high"]),
+        "low": float(c["low"]),
+        "close": float(c["close"]),
+    }
+
+
+def _extract_tick(tick):
     ts = tick.get("time")
     if ts is None:
         ts = tick.get("timestamp")
     if ts is None:
         raise KeyError("tick has neither 'time' nor 'timestamp'")
-
     ts = int(float(ts))
-    if ts > 10_000_000_000:      # milliseconds -> seconds
+    if ts > 10_000_000_000:
         ts //= 1000
 
     price = tick.get("close")
@@ -67,13 +88,22 @@ def _extract_tick(tick):
         price = tick.get("price")
     if price is None:
         raise KeyError("tick has neither 'close' nor 'price'")
-
     return ts, float(price)
 
 
 def _bucket(ts):
-    """Start-of-bucket timestamp for a given tick time."""
     return (ts // TIMEFRAME) * TIMEFRAME
+
+
+def _dedupe_sorted(candles):
+    seen = set()
+    out = []
+    for c in sorted(candles, key=lambda x: x["time"]):
+        if c["time"] in seen:
+            continue
+        seen.add(c["time"])
+        out.append(c)
+    return out
 
 
 def _count_gaps(candles):
@@ -87,15 +117,67 @@ def _count_gaps(candles):
     return gaps
 
 
-def _close_forming(state_forming):
-    """Return a copy of the forming candle suitable for the closed list."""
-    return dict(state_forming)
+async def _seed(client):
+    """
+    Paginated backfill, per the developer's example.
+
+    subscribe_symbol() opens the history gate; sleep() lets it open.
+    Then walk server_time backward in PAGE_SIZE-candle steps.
+    """
+    await client.subscribe_symbol(ASSET)
+    await asyncio.sleep(WARMUP_S)
+
+    server_time = await client.get_server_time()
+
+    pages = max(1, SEED_CANDLES // PAGE_SIZE)
+    total = []
+
+    for i in range(pages):
+        server_time -= PAGE_SIZE * TIMEFRAME
+        if server_time < 0:
+            break
+
+        try:
+            page = await client.get_candles_advanced(
+                ASSET,
+                TIMEFRAME,
+                PAGE_SIZE * TIMEFRAME,
+                server_time,
+            )
+        except Exception as e:
+            print(
+                f"[seed] page {i} failed: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            continue
+
+        if not page:
+            print(f"[seed] page {i} empty — stopping", flush=True)
+            break
+
+        parsed = []
+        for c in page:
+            try:
+                parsed.append(_normalize(c))
+            except Exception:
+                continue
+
+        total = parsed + total
+        print(
+            f"[seed] page {i}: +{len(parsed)} (total {len(total)})",
+            flush=True,
+        )
+
+        # Polite pause between pages.
+        await asyncio.sleep(0.3)
+
+    deduped = _dedupe_sorted(total)
+    return deduped[-SEED_CANDLES:]
 
 
 def _ingest_tick(ts, price):
     """
     Fold one tick into the current bucket, or start a new bucket.
-
     Called under _lock.
     """
     bucket = _bucket(ts)
@@ -120,8 +202,7 @@ def _ingest_tick(ts, price):
         return
 
     if bucket > forming["time"]:
-        # Previous bucket is done — close it and start the new one.
-        closed = _close_forming(forming)
+        closed = dict(forming)
         _state["candles"] = (_state["candles"] + [closed])[-MAX_CANDLES:]
         _state["forming"] = {
             "time": bucket,
@@ -133,8 +214,7 @@ def _ingest_tick(ts, price):
         _state["gaps_remaining"] = _count_gaps(_state["candles"])
         return
 
-    # bucket < forming["time"]: a late tick for an already-closed bucket.
-    # Drop it. We do not retroactively rewrite closed candles.
+    # Late tick for an already-closed bucket — drop.
     return
 
 
@@ -164,18 +244,35 @@ async def _stream():
 
     while not _stop.is_set():
         try:
+            # --- Seed ---
+            with _lock:
+                _state["error"] = None
+
+            try:
+                seeded = await _seed(client)
+            except Exception as e:
+                with _lock:
+                    _state["error"] = f"seed failed: {type(e).__name__}: {e}"
+                raise
+
+            with _lock:
+                _state["candles"] = seeded
+                _state["seeded"] = True
+                _state["seed_count"] = len(seeded)
+                _state["gaps_remaining"] = _count_gaps(seeded)
+
+            print(f"[seed] final: {len(seeded)} candles", flush=True)
+
+            # --- Stream ticks ---
             stream = await client.subscribe_symbol(ASSET)
 
             with _lock:
                 _state["connected"] = client.is_connected()
-                _state["error"] = None
 
             async for tick in stream:
                 if _stop.is_set():
                     break
 
-                # Log the first few raw ticks so the shape is visible
-                # in Railway logs if the field names ever change again.
                 if sample_logged < 5:
                     print(f"[tick sample] {tick!r}", flush=True)
                     sample_logged += 1
@@ -195,7 +292,6 @@ async def _stream():
                     _state["ticks"] += 1
                     _state["last_tick_ts"] = time.time()
                     _state["connected"] = client.is_connected()
-                    _state["last_raw_tick"] = tick
 
             retry_delay = 1.0
             await asyncio.sleep(0.5)
@@ -252,6 +348,8 @@ def snapshot():
             "timeframe": TIMEFRAME,
             "connected": _state["connected"],
             "error": _state["error"],
+            "seeded": _state["seeded"],
+            "seed_count": _state["seed_count"],
             "candles": list(_state["candles"]),
             "forming": (
                 dict(_state["forming"]) if _state["forming"] else None
