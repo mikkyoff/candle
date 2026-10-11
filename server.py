@@ -13,6 +13,7 @@ The library handles:
 
 We only need to:
   - hold the latest snapshot in memory for the HTTP layer
+  - detect a seam between the seed and the first live tick
   - restart the generator if it ever ends or raises
 """
 
@@ -26,11 +27,6 @@ TIMEFRAME = int(os.getenv("TIMEFRAME", "60"))
 SEED_CANDLES = int(os.getenv("SEED_CANDLES", "150"))
 SSID = os.getenv("POCKET_OPTION_SSID")
 
-# Library returns each closed candle with 'time' (int, seconds) and OHLC.
-# We keep the last SEED_CANDLES here. No indicator math in this file —
-# the browser computes RSI/EMA/BB from the same series the chart draws,
-# so the numbers and the lines can never disagree.
-
 _state = {
     "candles": [],          # list[dict], oldest first, closed only
     "forming": None,        # dict | None, current in-progress candle
@@ -40,6 +36,8 @@ _state = {
     "ticks": 0,
     "last_tick_ts": 0.0,
     "started_at": time.time(),
+    "gaps_patched": 0,
+    "gaps_remaining": 0,
 }
 _lock = threading.Lock()
 
@@ -69,6 +67,50 @@ def _dedupe_sorted(candles):
         seen.add(c["time"])
         out.append(c)
     return out
+
+
+def _count_gaps(candles):
+    """Count missing buckets inside a closed-candle series."""
+    if len(candles) < 2:
+        return 0
+    gaps = 0
+    for i in range(1, len(candles)):
+        delta = candles[i]["time"] - candles[i - 1]["time"]
+        if delta > TIMEFRAME:
+            gaps += delta // TIMEFRAME - 1
+    return gaps
+
+
+async def _fetch_gap(client, from_time, to_time):
+    """
+    Pull the missing candles between from_time (exclusive) and
+    to_time (exclusive) using the advanced endpoint.
+
+    get_candles_advanced(asset, period, offset, time) anchors at
+    `time` and returns the window [time - offset, time]. We anchor
+    at to_time and ask for exactly the gap width plus one bucket.
+    """
+    span = to_time - from_time - TIMEFRAME
+    if span <= 0:
+        return []
+
+    offset_secs = span + TIMEFRAME
+    anchor = to_time
+
+    try:
+        raw = await client.get_candles_advanced(
+            ASSET, TIMEFRAME, offset_secs, anchor
+        )
+    except Exception as e:
+        with _lock:
+            _state["error"] = f"gap patch failed: {type(e).__name__}: {e}"
+        return []
+
+    if not raw:
+        return []
+
+    parsed = [_normalize(c) for c in raw]
+    return [c for c in parsed if from_time < c["time"] < to_time]
 
 
 async def _stream():
@@ -106,21 +148,53 @@ async def _stream():
                 parsed_forming = _normalize(forming) if forming else None
 
                 with _lock:
-                    if first_yield:
-                        # Keep only the tail we display.
+                    last_known = (
+                        _state["candles"][-1]["time"]
+                        if _state["candles"]
+                        else None
+                    )
+
+                if first_yield:
+                    with _lock:
                         _state["candles"] = parsed_closed[-SEED_CANDLES:]
                         _state["seeded"] = True
-                        first_yield = False
+                    first_yield = False
+
+                elif parsed_closed and last_known:
+                    incoming_first = parsed_closed[0]["time"]
+
+                    # Seam detected: the incoming series starts more than
+                    # one bucket after what we already hold.
+                    if incoming_first - last_known > TIMEFRAME:
+                        patch = await _fetch_gap(
+                            client, last_known, incoming_first
+                        )
+                        if patch:
+                            merged = _dedupe_sorted(
+                                _state["candles"] + patch + parsed_closed
+                            )
+                            with _lock:
+                                _state["candles"] = merged[-SEED_CANDLES:]
+                                _state["gaps_patched"] += 1
+                        else:
+                            with _lock:
+                                _state["candles"] = parsed_closed[-SEED_CANDLES:]
                     else:
+                        with _lock:
+                            _state["candles"] = parsed_closed[-SEED_CANDLES:]
+
+                else:
+                    with _lock:
                         _state["candles"] = parsed_closed[-SEED_CANDLES:]
 
+                with _lock:
                     _state["forming"] = parsed_forming
                     _state["connected"] = client.is_connected()
                     _state["ticks"] += 1
                     _state["last_tick_ts"] = time.time()
                     _state["error"] = None
+                    _state["gaps_remaining"] = _count_gaps(_state["candles"])
 
-            # Generator ended cleanly — restart after a beat.
             retry_delay = 1.0
             await asyncio.sleep(0.5)
 
@@ -181,6 +255,8 @@ def snapshot():
             "candles": list(_state["candles"]),
             "forming": dict(_state["forming"]) if _state["forming"] else None,
             "ticks": _state["ticks"],
+            "gaps_patched": _state["gaps_patched"],
+            "gaps_remaining": _state["gaps_remaining"],
             "last_tick_age_s": round(now - last, 2) if last else None,
             "uptime_s": round(now - _state["started_at"], 1),
         }
