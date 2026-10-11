@@ -41,8 +41,25 @@ _stop = threading.Event()
 
 
 def _normalize(c):
+    """
+    Coerce a library candle into the shape Lightweight Charts wants.
+
+    The Rust Candle struct serializes with 'timestamp' (seconds), but
+    some paths in the wrapper emit 'time'. Accept either.
+    """
+    ts = c.get("time")
+    if ts is None:
+        ts = c.get("timestamp")
+    if ts is None:
+        raise KeyError("candle has neither 'time' nor 'timestamp'")
+
+    ts = int(float(ts))
+    # Some sources emit milliseconds; normalize to seconds.
+    if ts > 10_000_000_000:
+        ts //= 1000
+
     return {
-        "time": int(c["time"]),
+        "time": ts,
         "open": float(c["open"]),
         "high": float(c["high"]),
         "low": float(c["low"]),
@@ -163,9 +180,6 @@ async def _stream():
             if not seeded:
                 raise RuntimeError("seed produced zero candles")
 
-            # Time-aligned subscription. subscribe_symbol_timed takes a
-            # Python timedelta and returns closed candles aligned to
-            # :00/:15/:30/:45 boundaries.
             delta = datetime.timedelta(seconds=TIMEFRAME)
             stream = await client.subscribe_symbol_timed(ASSET, delta)
 
@@ -175,7 +189,12 @@ async def _stream():
 
                 try:
                     new_candle = _normalize(candle)
-                except Exception:
+                except Exception as e:
+                    print(
+                        f"[stream skip] {type(e).__name__}: {e} "
+                        f"— candle was {candle!r}",
+                        flush=True,
+                    )
                     continue
 
                 with _lock:
