@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EURCHF_otc — 15s Live Chart</title>
+<title>EURCHF_otc — 1m Live Chart</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   * { box-sizing: border-box; }
@@ -38,7 +38,7 @@
 <body>
 
 <div id="header">
-  <div class="title">EURCHF_otc — 15s Live Chart</div>
+  <div class="title">EURCHF_otc — 1m Live Chart</div>
   <div id="status"><span class="badge warn">Connecting...</span></div>
 </div>
 
@@ -119,7 +119,7 @@ const tickBarEl = document.getElementById("tickBar");
 const chart = LightweightCharts.createChart(chartContainer, {
   layout: { background: { color: "#0d1017" }, textColor: "#d1d4dc" },
   grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
-  timeScale: { timeVisible: true, secondsVisible: true, borderColor: "#2a2e39" },
+  timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2a2e39" },
   rightPriceScale: { borderColor: "#2a2e39" },
 });
 
@@ -165,34 +165,30 @@ async function tick() {
       setStatus("err", `ERROR: ${snap.error}`);
       return;
     }
-    if (!snap.candles.length && !snap.forming) {
-      setStatus("warn", "WARMING UP — waiting for first tick");
+    if (!snap.seeded && !snap.candles.length) {
+      setStatus("warn", "SEEDING HISTORY — 150 candles...");
       return;
     }
     if (!snap.connected) {
       setStatus("warn", "DISCONNECTED — reconnecting");
     } else {
       const age = snap.last_tick_age_s != null ? `${snap.last_tick_age_s}s` : "—";
-      setStatus("ok", `LIVE · ${snap.candles.length} bars · last tick ${age}`);
+      const gaps = snap.gaps_remaining > 0 ? ` · gaps ${snap.gaps_remaining}` : "";
+      setStatus("ok", `LIVE · ${snap.candles.length} bars · last tick ${age}${gaps}`);
     }
 
     const closed = snap.candles;
     const forming = snap.forming;
 
-    // Render closed series as the base.
     if (closed.length) {
       candleSeries.setData(closed);
     }
-
-    // Overlay the forming bar. Lightweight Charts' update() replaces
-    // the bar at that timestamp, so it grows tick by tick.
     if (forming) {
       candleSeries.update(forming);
     }
 
-    // Indicators computed over closed + forming so the values move
-    // in real time alongside the right edge of the chart.
     const display = forming ? closed.concat([forming]) : closed;
+    if (!display.length) return;
 
     const lines = buildIndicatorLines(display);
     bbUpperSeries.setData(lines.bbU);
