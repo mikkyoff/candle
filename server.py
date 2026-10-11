@@ -161,8 +161,7 @@ async def _fetch_gap(client, from_time, to_time):
 async def _stream():
     from BinaryOptionsToolsV2 import PocketOptionAsync
     from BinaryOptionsToolsV2.config import Config
-    from BinaryOptionsToolsV2.pocketoption.candle import SubscriptionType
-
+    from BinaryOptionsToolsV2 import SubscriptionType
     if not SSID:
         raise RuntimeError("POCKET_OPTION_SSID is not set")
 
