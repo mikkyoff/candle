@@ -1,17 +1,22 @@
 """
-Time-aligned 15s candle stream for EURCHF_otc. No seed.
+Live 15s candles for EURCHF_otc, built from raw ticks.
 
-Subscribes with subscribe_symbol_timed(asset, timedelta(seconds=15))
-and appends each closed candle as it arrives.
+subscribe_symbol(asset) yields raw price updates. We bucket them into
+15s candles ourselves, so:
 
-Time-aligned candles close on 15-second boundaries of the day:
-:00, :15, :30, :45. The stream yields CLOSED candles only.
+  - the forming candle updates in real time (no waiting for close),
+  - bucket boundaries are ours (:00/:15/:30/:45 of the wall clock),
+  - a closed candle is emitted the instant a tick lands in the next bucket.
 
-The chart starts empty and fills in — one new bar every 15 seconds.
+Time alignment:
+  bucket_start(t) = (t // 15) * 15
+
+The chart receives both:
+  - `candles` : the closed series (immutable once written)
+  - `forming` : the current in-progress candle, updated on every tick
 """
 
 import asyncio
-import datetime
 import os
 import threading
 import time
@@ -22,13 +27,15 @@ MAX_CANDLES = int(os.getenv("MAX_CANDLES", "150"))
 SSID = os.getenv("POCKET_OPTION_SSID")
 
 _state = {
-    "candles": [],
+    "candles": [],           # closed only, oldest first
+    "forming": None,         # dict | None
     "connected": False,
     "error": None,
     "ticks": 0,
     "last_tick_ts": 0.0,
     "started_at": time.time(),
     "gaps_remaining": 0,
+    "last_raw_tick": None,   # for debugging
 }
 _lock = threading.Lock()
 
@@ -37,30 +44,36 @@ _task = None
 _stop = threading.Event()
 
 
-def _normalize(c):
+def _extract_tick(tick):
     """
-    Coerce a library candle into the shape Lightweight Charts wants.
+    Pull (timestamp_seconds, price) out of a raw tick dict.
 
-    The Rust Candle struct serializes with 'timestamp' (seconds), but
-    some paths emit 'time'. Accept either. Normalize ms -> seconds.
+    Different code paths in the library serialize the time field
+    differently ('time' vs 'timestamp') and the price field
+    differently ('close' vs 'price'). Accept any combination.
     """
-    ts = c.get("time")
+    ts = tick.get("time")
     if ts is None:
-        ts = c.get("timestamp")
+        ts = tick.get("timestamp")
     if ts is None:
-        raise KeyError("candle has neither 'time' nor 'timestamp'")
+        raise KeyError("tick has neither 'time' nor 'timestamp'")
 
     ts = int(float(ts))
-    if ts > 10_000_000_000:
+    if ts > 10_000_000_000:      # milliseconds -> seconds
         ts //= 1000
 
-    return {
-        "time": ts,
-        "open": float(c["open"]),
-        "high": float(c["high"]),
-        "low": float(c["low"]),
-        "close": float(c["close"]),
-    }
+    price = tick.get("close")
+    if price is None:
+        price = tick.get("price")
+    if price is None:
+        raise KeyError("tick has neither 'close' nor 'price'")
+
+    return ts, float(price)
+
+
+def _bucket(ts):
+    """Start-of-bucket timestamp for a given tick time."""
+    return (ts // TIMEFRAME) * TIMEFRAME
 
 
 def _count_gaps(candles):
@@ -72,6 +85,57 @@ def _count_gaps(candles):
         if delta > TIMEFRAME:
             gaps += delta // TIMEFRAME - 1
     return gaps
+
+
+def _close_forming(state_forming):
+    """Return a copy of the forming candle suitable for the closed list."""
+    return dict(state_forming)
+
+
+def _ingest_tick(ts, price):
+    """
+    Fold one tick into the current bucket, or start a new bucket.
+
+    Called under _lock.
+    """
+    bucket = _bucket(ts)
+    forming = _state["forming"]
+
+    if forming is None:
+        _state["forming"] = {
+            "time": bucket,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+        }
+        return
+
+    if bucket == forming["time"]:
+        if price > forming["high"]:
+            forming["high"] = price
+        if price < forming["low"]:
+            forming["low"] = price
+        forming["close"] = price
+        return
+
+    if bucket > forming["time"]:
+        # Previous bucket is done — close it and start the new one.
+        closed = _close_forming(forming)
+        _state["candles"] = (_state["candles"] + [closed])[-MAX_CANDLES:]
+        _state["forming"] = {
+            "time": bucket,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+        }
+        _state["gaps_remaining"] = _count_gaps(_state["candles"])
+        return
+
+    # bucket < forming["time"]: a late tick for an already-closed bucket.
+    # Drop it. We do not retroactively rewrite closed candles.
+    return
 
 
 async def _stream():
@@ -96,50 +160,42 @@ async def _stream():
         _state["error"] = None
 
     retry_delay = 1.0
+    sample_logged = 0
 
     while not _stop.is_set():
         try:
-            delta = datetime.timedelta(seconds=TIMEFRAME)
-            stream = await client.subscribe_symbol_timed(ASSET, delta)
+            stream = await client.subscribe_symbol(ASSET)
 
             with _lock:
                 _state["connected"] = client.is_connected()
                 _state["error"] = None
 
-            async for candle in stream:
+            async for tick in stream:
                 if _stop.is_set():
                     break
 
+                # Log the first few raw ticks so the shape is visible
+                # in Railway logs if the field names ever change again.
+                if sample_logged < 5:
+                    print(f"[tick sample] {tick!r}", flush=True)
+                    sample_logged += 1
+
                 try:
-                    new_candle = _normalize(candle)
+                    ts, price = _extract_tick(tick)
                 except Exception as e:
                     print(
-                        f"[stream skip] {type(e).__name__}: {e} "
-                        f"— candle was {candle!r}",
+                        f"[tick skip] {type(e).__name__}: {e} "
+                        f"— tick was {tick!r}",
                         flush=True,
                     )
                     continue
 
                 with _lock:
-                    last = (
-                        _state["candles"][-1]
-                        if _state["candles"]
-                        else None
-                    )
-                    if last and new_candle["time"] <= last["time"]:
-                        # Duplicate or stale; drop.
-                        continue
-
-                    _state["candles"] = (
-                        _state["candles"] + [new_candle]
-                    )[-MAX_CANDLES:]
-
+                    _ingest_tick(ts, price)
                     _state["ticks"] += 1
                     _state["last_tick_ts"] = time.time()
                     _state["connected"] = client.is_connected()
-                    _state["gaps_remaining"] = _count_gaps(
-                        _state["candles"]
-                    )
+                    _state["last_raw_tick"] = tick
 
             retry_delay = 1.0
             await asyncio.sleep(0.5)
@@ -197,7 +253,9 @@ def snapshot():
             "connected": _state["connected"],
             "error": _state["error"],
             "candles": list(_state["candles"]),
-            "forming": None,
+            "forming": (
+                dict(_state["forming"]) if _state["forming"] else None
+            ),
             "ticks": _state["ticks"],
             "gaps_remaining": _state["gaps_remaining"],
             "last_tick_age_s": round(now - last, 2) if last else None,
