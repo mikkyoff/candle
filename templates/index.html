@@ -32,6 +32,7 @@
   .card .value { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .card .sub { font-size: 11px; color: #787b86; }
   .pos { color: #26a69a; } .neg { color: #ef5350; } .neutral { color: #d1d4dc; }
+  #tickBar { padding: 4px 18px; background: #0d1017; font-size: 11px; color: #787b86; font-family: ui-monospace, monospace; }
 </style>
 </head>
 <body>
@@ -67,6 +68,7 @@
       <span class="value" id="bbLoVal">—</span>
     </div>
   </div>
+  <div id="tickBar">—</div>
 </div>
 
 <script>
@@ -112,6 +114,7 @@ function computeEMA(closes, period = 6) {
 
 const chartContainer = document.getElementById("chart");
 const statusEl = document.getElementById("status");
+const tickBarEl = document.getElementById("tickBar");
 
 const chart = LightweightCharts.createChart(chartContainer, {
   layout: { background: { color: "#0d1017" }, textColor: "#d1d4dc" },
@@ -158,40 +161,53 @@ async function tick() {
     const res = await fetch("/api/candles", { cache: "no-store" });
     const snap = await res.json();
 
-    if (snap.error && !snap.candles.length) {
+    if (snap.error && !snap.candles.length && !snap.forming) {
       setStatus("err", `ERROR: ${snap.error}`);
       return;
     }
-    if (!snap.candles.length) {
-      setStatus("warn", "WARMING UP — waiting for first 15s bar");
+    if (!snap.candles.length && !snap.forming) {
+      setStatus("warn", "WARMING UP — waiting for first tick");
       return;
     }
     if (!snap.connected) {
       setStatus("warn", "DISCONNECTED — reconnecting");
     } else {
       const age = snap.last_tick_age_s != null ? `${snap.last_tick_age_s}s` : "—";
-      const gaps = snap.gaps_remaining > 0 ? ` · gaps ${snap.gaps_remaining}` : "";
-      setStatus("ok", `LIVE · ${snap.candles.length} bars · last bar ${age}${gaps}`);
+      setStatus("ok", `LIVE · ${snap.candles.length} bars · last tick ${age}`);
     }
 
-    const candles = snap.candles;
+    const closed = snap.candles;
+    const forming = snap.forming;
 
-    candleSeries.setData(candles);
+    // Render closed series as the base.
+    if (closed.length) {
+      candleSeries.setData(closed);
+    }
 
-    const lines = buildIndicatorLines(candles);
+    // Overlay the forming bar. Lightweight Charts' update() replaces
+    // the bar at that timestamp, so it grows tick by tick.
+    if (forming) {
+      candleSeries.update(forming);
+    }
+
+    // Indicators computed over closed + forming so the values move
+    // in real time alongside the right edge of the chart.
+    const display = forming ? closed.concat([forming]) : closed;
+
+    const lines = buildIndicatorLines(display);
     bbUpperSeries.setData(lines.bbU);
     bbMiddleSeries.setData(lines.bbM);
     bbLowerSeries.setData(lines.bbL);
     emaSeries.setData(lines.ema);
 
-    if (!initialFit && candles.length >= 2) {
+    if (!initialFit && display.length >= 2) {
       chart.timeScale().fitContent();
       initialFit = true;
     } else if (initialFit) {
       chart.timeScale().scrollToRealTime();
     }
 
-    const closes = candles.map(c => c.close);
+    const closes = display.map(c => c.close);
     const rsi = computeRSI(closes);
     const [bbU, bbM, bbL] = computeBollinger(closes);
     const ema = computeEMA(closes);
@@ -210,6 +226,14 @@ async function tick() {
     document.getElementById("bbUpVal").textContent = fmt(bbU);
     document.getElementById("bbMidVal").textContent = fmt(bbM);
     document.getElementById("bbLoVal").textContent = fmt(bbL);
+
+    if (forming) {
+      tickBarEl.textContent =
+        `forming  t=${forming.time}  O=${fmt(forming.open)}  H=${fmt(forming.high)}  ` +
+        `L=${fmt(forming.low)}  C=${fmt(forming.close)}  ·  ticks=${snap.ticks}`;
+    } else {
+      tickBarEl.textContent = `ticks=${snap.ticks}`;
+    }
 
   } catch (e) {
     setStatus("err", `CLIENT: ${e.message}`);
