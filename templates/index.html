@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EURCHF_otc — 1m Live Chart</title>
+<title>BB Bandwidth — 10s · EURGBP / EURUSD / AUDUSD (OTC)</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   * { box-sizing: border-box; }
@@ -20,136 +20,86 @@
   .warn { background: #f0a500; color: white; }
   #chartWrap { display: flex; flex-direction: column; height: calc(100vh - 48px); }
   #chart { flex: 1 1 auto; min-height: 0; width: 100%; }
-  #indicatorBar {
+  #tableWrap {
     flex: 0 0 auto; display: flex; gap: 1px;
     background: #2a2e39; border-top: 1px solid #2a2e39;
   }
-  .card {
-    flex: 1 1 0; min-width: 150px; background: #1e222d;
-    padding: 8px 14px; display: flex; flex-direction: column; gap: 2px;
+  .assetCard {
+    flex: 1 1 0; min-width: 200px; background: #1e222d;
+    padding: 10px 14px; display: flex; flex-direction: column; gap: 4px;
+    border-top: 3px solid transparent;
   }
-  .card .label { font-size: 10px; letter-spacing: 1px; color: #787b86; text-transform: uppercase; }
-  .card .value { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .card .sub { font-size: 11px; color: #787b86; }
+  .assetCard .name { font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
+  .assetCard .bw { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .assetCard .meta { font-size: 11px; color: #787b86; font-variant-numeric: tabular-nums; }
   .pos { color: #26a69a; } .neg { color: #ef5350; } .neutral { color: #d1d4dc; }
-  #tickBar { padding: 4px 18px; background: #0d1017; font-size: 11px; color: #787b86; font-family: ui-monospace, monospace; }
 </style>
 </head>
 <body>
 
 <div id="header">
-  <div class="title">EURCHF_otc — 1m Live Chart</div>
+  <div class="title">BB Bandwidth — 10s · 20-period · 2σ</div>
   <div id="status"><span class="badge warn">Connecting...</span></div>
 </div>
 
 <div id="chartWrap">
   <div id="chart"></div>
-  <div id="indicatorBar">
-    <div class="card">
-      <span class="label">RSI (14)</span>
-      <span class="value" id="rsiVal">—</span>
-      <span class="sub" id="rsiSub">warming up</span>
-    </div>
-    <div class="card">
-      <span class="label">EMA (6)</span>
-      <span class="value" id="emaVal">—</span>
-      <span class="sub">Price vs EMA</span>
-    </div>
-    <div class="card">
-      <span class="label">BB Upper (20, 2σ)</span>
-      <span class="value" id="bbUpVal">—</span>
-    </div>
-    <div class="card">
-      <span class="label">BB Middle</span>
-      <span class="value" id="bbMidVal">—</span>
-    </div>
-    <div class="card">
-      <span class="label">BB Lower</span>
-      <span class="value" id="bbLoVal">—</span>
-    </div>
-  </div>
-  <div id="tickBar">—</div>
+  <div id="tableWrap"></div>
 </div>
 
 <script>
-function computeRSI(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const d = closes[i] - closes[i - 1];
-    if (d >= 0) gains += d; else losses += -d;
-  }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  for (let i = period + 1; i < closes.length; i++) {
-    const d = closes[i] - closes[i - 1];
-    const gain = d > 0 ? d : 0;
-    const loss = d < 0 ? -d : 0;
-    avgGain = (avgGain * (period - 1) + gain) / period;
-    avgLoss = (avgLoss * (period - 1) + loss) / period;
-  }
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
-}
-
-function computeBollinger(closes, period = 20, mult = 2) {
-  if (closes.length < period) return [null, null, null];
-  const win = closes.slice(-period);
-  const mean = win.reduce((a, b) => a + b, 0) / period;
-  const variance = win.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
-  const sd = Math.sqrt(variance);
-  return [mean + mult * sd, mean, mean - mult * sd];
-}
-
-function computeEMA(closes, period = 6) {
-  if (closes.length < period) return null;
-  const k = 2 / (period + 1);
-  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < closes.length; i++) {
-    ema = closes[i] * k + ema * (1 - k);
-  }
-  return ema;
-}
+// Palette per asset — one line colour each, reused in the cards.
+const PALETTE = ["#26a69a", "#2962ff", "#e91e63", "#f0a500"];
+const fmt = (n, d = 4) =>
+  (n == null || isNaN(n)) ? "—" : Number(n).toFixed(d);
 
 const chartContainer = document.getElementById("chart");
 const statusEl = document.getElementById("status");
-const tickBarEl = document.getElementById("tickBar");
+const tableWrap = document.getElementById("tableWrap");
 
 const chart = LightweightCharts.createChart(chartContainer, {
   layout: { background: { color: "#0d1017" }, textColor: "#d1d4dc" },
   grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
-  timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2a2e39" },
+  timeScale: { timeVisible: true, secondsVisible: true, borderColor: "#2a2e39" },
   rightPriceScale: { borderColor: "#2a2e39" },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
 });
 
-const candleSeries = chart.addCandlestickSeries({
-  upColor: "#26a69a", downColor: "#ef5350", borderVisible: false,
-  wickUpColor: "#26a69a", wickDownColor: "#ef5350",
-});
-const bbUpperSeries = chart.addLineSeries({ color: "#2962ff", lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
-const bbMiddleSeries = chart.addLineSeries({ color: "#f0a500", lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
-const bbLowerSeries = chart.addLineSeries({ color: "#2962ff", lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
-const emaSeries = chart.addLineSeries({ color: "#e91e63", lineWidth: 2, priceLineVisible: false });
-
+// One line series per asset, keyed by symbol name.
+const seriesByAsset = {};
 let initialFit = false;
-const fmt = (n, d = 5) => (n == null || isNaN(n)) ? "—" : Number(n).toFixed(d);
 
-function buildIndicatorLines(candles) {
-  const closes = candles.map(c => c.close);
-  const bbU = [], bbM = [], bbL = [], ema = [];
-  for (let i = 0; i < candles.length; i++) {
-    const slice = closes.slice(0, i + 1);
-    const [u, m, l] = computeBollinger(slice);
-    if (u != null) {
-      bbU.push({ time: candles[i].time, value: u });
-      bbM.push({ time: candles[i].time, value: m });
-      bbL.push({ time: candles[i].time, value: l });
-    }
-    const ev = computeEMA(slice);
-    if (ev != null) ema.push({ time: candles[i].time, value: ev });
-  }
-  return { bbU, bbM, bbL, ema };
+function ensureSeries(asset, index) {
+  if (seriesByAsset[asset]) return seriesByAsset[asset];
+  const color = PALETTE[index % PALETTE.length];
+  const s = chart.addLineSeries({
+    color,
+    lineWidth: 2,
+    priceLineVisible: false,
+    lastValueVisible: true,
+    title: asset,
+  });
+  seriesByAsset[asset] = s;
+  return s;
+}
+
+// Build the per-asset cards once, then just update values.
+let cardsBuilt = false;
+
+function buildCards(assets) {
+  tableWrap.innerHTML = "";
+  assets.forEach((a, i) => {
+    const card = document.createElement("div");
+    card.className = "assetCard";
+    card.style.borderTopColor = PALETTE[i % PALETTE.length];
+    card.innerHTML = `
+      <div class="name" style="color:${PALETTE[i % PALETTE.length]}">${a.asset}</div>
+      <div class="bw" id="bw-${a.asset}">—</div>
+      <div class="meta" id="meta-${a.asset}">—</div>
+    `;
+    tableWrap.appendChild(card);
+  });
+  cardsBuilt = true;
 }
 
 function setStatus(kind, text) {
@@ -158,77 +108,66 @@ function setStatus(kind, text) {
 
 async function tick() {
   try {
-    const res = await fetch("/api/candles", { cache: "no-store" });
+    const res = await fetch("/api/state", { cache: "no-store" });
     const snap = await res.json();
 
-    if (snap.error && !snap.candles.length && !snap.forming) {
+    if (!cardsBuilt) buildCards(snap.assets);
+
+    const anyTicks = snap.assets.some(a => a.ticks > 0);
+
+    if (snap.error && !anyTicks) {
       setStatus("err", `ERROR: ${snap.error}`);
       return;
     }
-    if (!snap.seeded && !snap.candles.length) {
-      setStatus("warn", "SEEDING HISTORY — 150 candles...");
+    if (!anyTicks) {
+      setStatus("warn", "WARMING UP — waiting for first ticks");
       return;
     }
     if (!snap.connected) {
       setStatus("warn", "DISCONNECTED — reconnecting");
     } else {
-      const age = snap.last_tick_age_s != null ? `${snap.last_tick_age_s}s` : "—";
-      const gaps = snap.gaps_remaining > 0 ? ` · gaps ${snap.gaps_remaining}` : "";
-      setStatus("ok", `LIVE · ${snap.candles.length} bars · last tick ${age}${gaps}`);
+      const age = snap.last_tick_age_s != null
+        ? `${snap.last_tick_age_s}s` : "—";
+      setStatus("ok", `LIVE · 10s bars · last tick ${age}`);
     }
 
-    const closed = snap.candles;
-    const forming = snap.forming;
+    // Feed each asset's bandwidth series to its line.
+    snap.assets.forEach((a, i) => {
+      const series = ensureSeries(a.asset, i);
+      if (a.bandwidth_series.length) {
+        series.setData(a.bandwidth_series);
+      }
 
-    if (closed.length) {
-      candleSeries.setData(closed);
-    }
-    if (forming) {
-      candleSeries.update(forming);
-    }
+      const bwEl = document.getElementById(`bw-${a.asset}`);
+      const metaEl = document.getElementById(`meta-${a.asset}`);
+      if (bwEl) {
+        bwEl.textContent =
+          a.bandwidth_pct == null
+            ? "warming up"
+            : `${a.bandwidth_pct.toFixed(4)}%`;
+        bwEl.className =
+          "bw " +
+          (a.bandwidth_pct == null
+            ? "neutral"
+            : a.bandwidth_pct > 0.1
+            ? "pos"
+            : "neutral");
+      }
+      if (metaEl) {
+        const idle =
+          a.last_tick_ts > 0
+            ? `${(Date.now() / 1000 - a.last_tick_ts).toFixed(1)}s ago`
+            : "—";
+        metaEl.textContent =
+          `${a.closed_count} bars · ${a.ticks} ticks · last ${idle}`;
+      }
+    });
 
-    const display = forming ? closed.concat([forming]) : closed;
-    if (!display.length) return;
-
-    const lines = buildIndicatorLines(display);
-    bbUpperSeries.setData(lines.bbU);
-    bbMiddleSeries.setData(lines.bbM);
-    bbLowerSeries.setData(lines.bbL);
-    emaSeries.setData(lines.ema);
-
-    if (!initialFit && display.length >= 2) {
+    if (!initialFit && snap.assets.some(a => a.bandwidth_series.length > 2)) {
       chart.timeScale().fitContent();
       initialFit = true;
     } else if (initialFit) {
       chart.timeScale().scrollToRealTime();
-    }
-
-    const closes = display.map(c => c.close);
-    const rsi = computeRSI(closes);
-    const [bbU, bbM, bbL] = computeBollinger(closes);
-    const ema = computeEMA(closes);
-    const price = closes[closes.length - 1];
-
-    const rsiEl = document.getElementById("rsiVal");
-    rsiEl.textContent = rsi == null ? "—" : rsi.toFixed(2);
-    rsiEl.className = "value " + (rsi == null ? "neutral" : rsi >= 70 ? "neg" : rsi <= 30 ? "pos" : "neutral");
-    document.getElementById("rsiSub").textContent =
-      rsi == null ? "warming up" : rsi >= 70 ? "Overbought" : rsi <= 30 ? "Oversold" : "Neutral";
-
-    document.getElementById("emaVal").textContent = fmt(ema);
-    document.getElementById("emaVal").className =
-      "value " + (ema == null ? "neutral" : price > ema ? "pos" : "neg");
-
-    document.getElementById("bbUpVal").textContent = fmt(bbU);
-    document.getElementById("bbMidVal").textContent = fmt(bbM);
-    document.getElementById("bbLoVal").textContent = fmt(bbL);
-
-    if (forming) {
-      tickBarEl.textContent =
-        `forming  t=${forming.time}  O=${fmt(forming.open)}  H=${fmt(forming.high)}  ` +
-        `L=${fmt(forming.low)}  C=${fmt(forming.close)}  ·  ticks=${snap.ticks}`;
-    } else {
-      tickBarEl.textContent = `ticks=${snap.ticks}`;
     }
 
   } catch (e) {
