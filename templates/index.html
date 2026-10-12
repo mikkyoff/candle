@@ -18,7 +18,13 @@
   .ok { background: #26a69a; color: white; }
   .err { background: #ef5350; color: white; }
   .warn { background: #f0a500; color: white; }
-  #chartWrap { display: flex; flex-direction: column; height: calc(100vh - 48px); }
+  #diag {
+    padding: 6px 18px; background: #161b22;
+    font-family: ui-monospace, monospace; font-size: 11px;
+    color: #787b86; border-bottom: 1px solid #2a2e39;
+    white-space: pre-wrap;
+  }
+  #chartWrap { display: flex; flex-direction: column; height: calc(100vh - 82px); }
   #chart { flex: 1 1 auto; min-height: 0; width: 100%; }
   #tableWrap {
     flex: 0 0 auto; display: flex; gap: 1px;
@@ -42,13 +48,14 @@
   <div id="status"><span class="badge warn">Connecting...</span></div>
 </div>
 
+<div id="diag">boot</div>
+
 <div id="chartWrap">
   <div id="chart"></div>
   <div id="tableWrap"></div>
 </div>
 
 <script>
-// Palette per asset — one line colour each, reused in the cards.
 const PALETTE = ["#26a69a", "#2962ff", "#e91e63", "#f0a500"];
 const fmt = (n, d = 4) =>
   (n == null || isNaN(n)) ? "—" : Number(n).toFixed(d);
@@ -56,6 +63,7 @@ const fmt = (n, d = 4) =>
 const chartContainer = document.getElementById("chart");
 const statusEl = document.getElementById("status");
 const tableWrap = document.getElementById("tableWrap");
+const diagEl = document.getElementById("diag");
 
 const chart = LightweightCharts.createChart(chartContainer, {
   layout: { background: { color: "#0d1017" }, textColor: "#d1d4dc" },
@@ -65,26 +73,21 @@ const chart = LightweightCharts.createChart(chartContainer, {
   crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
 });
 
-// One line series per asset, keyed by symbol name.
 const seriesByAsset = {};
 let initialFit = false;
+let cardsBuilt = false;
 
 function ensureSeries(asset, index) {
   if (seriesByAsset[asset]) return seriesByAsset[asset];
   const color = PALETTE[index % PALETTE.length];
   const s = chart.addLineSeries({
-    color,
-    lineWidth: 2,
-    priceLineVisible: false,
-    lastValueVisible: true,
+    color, lineWidth: 2,
+    priceLineVisible: false, lastValueVisible: true,
     title: asset,
   });
   seriesByAsset[asset] = s;
   return s;
 }
-
-// Build the per-asset cards once, then just update values.
-let cardsBuilt = false;
 
 function buildCards(assets) {
   tableWrap.innerHTML = "";
@@ -94,7 +97,7 @@ function buildCards(assets) {
     card.style.borderTopColor = PALETTE[i % PALETTE.length];
     card.innerHTML = `
       <div class="name" style="color:${PALETTE[i % PALETTE.length]}">${a.asset}</div>
-      <div class="bw" id="bw-${a.asset}">—</div>
+      <div class="bw neutral" id="bw-${a.asset}">warming up</div>
       <div class="meta" id="meta-${a.asset}">—</div>
     `;
     tableWrap.appendChild(card);
@@ -106,10 +109,20 @@ function setStatus(kind, text) {
   statusEl.innerHTML = `<span class="badge ${kind}">${text}</span>`;
 }
 
+function setDiag(text) {
+  diagEl.textContent = text;
+}
+
 async function tick() {
   try {
     const res = await fetch("/api/state", { cache: "no-store" });
     const snap = await res.json();
+
+    if (!snap || !Array.isArray(snap.assets)) {
+      setStatus("err", "BAD PAYLOAD");
+      setDiag(`response status=${res.status} body=${JSON.stringify(snap).slice(0, 400)}`);
+      return;
+    }
 
     if (!cardsBuilt) buildCards(snap.assets);
 
@@ -117,13 +130,9 @@ async function tick() {
 
     if (snap.error && !anyTicks) {
       setStatus("err", `ERROR: ${snap.error}`);
-      return;
-    }
-    if (!anyTicks) {
+    } else if (!anyTicks) {
       setStatus("warn", "WARMING UP — waiting for first ticks");
-      return;
-    }
-    if (!snap.connected) {
+    } else if (!snap.connected) {
       setStatus("warn", "DISCONNECTED — reconnecting");
     } else {
       const age = snap.last_tick_age_s != null
@@ -131,7 +140,21 @@ async function tick() {
       setStatus("ok", `LIVE · 10s bars · last tick ${age}`);
     }
 
-    // Feed each asset's bandwidth series to its line.
+    const parts = [];
+    snap.assets.forEach(a => {
+      parts.push(
+        `${a.asset}: ticks=${a.ticks} bars=${a.closed_count} ` +
+        `bw_pts=${a.bandwidth_series.length} ` +
+        `err=${a.sub_error || "none"}`
+      );
+    });
+    parts.push(
+      `http=${res.status} connected=${snap.connected} ` +
+      `snapshots=${snap.snapshots} uptime=${snap.uptime_s}s`
+    );
+    if (snap.error) parts.push(`server_err=${snap.error}`);
+    setDiag(parts.join("\n"));
+
     snap.assets.forEach((a, i) => {
       const series = ensureSeries(a.asset, i);
       if (a.bandwidth_series.length) {
@@ -141,23 +164,15 @@ async function tick() {
       const bwEl = document.getElementById(`bw-${a.asset}`);
       const metaEl = document.getElementById(`meta-${a.asset}`);
       if (bwEl) {
-        bwEl.textContent =
-          a.bandwidth_pct == null
-            ? "warming up"
-            : `${a.bandwidth_pct.toFixed(4)}%`;
-        bwEl.className =
-          "bw " +
-          (a.bandwidth_pct == null
-            ? "neutral"
-            : a.bandwidth_pct > 0.1
-            ? "pos"
-            : "neutral");
+        bwEl.textContent = a.bandwidth_pct == null
+          ? "warming up"
+          : `${a.bandwidth_pct.toFixed(4)}%`;
+        bwEl.className = "bw " + (a.bandwidth_pct == null ? "neutral" : "pos");
       }
       if (metaEl) {
-        const idle =
-          a.last_tick_ts > 0
-            ? `${(Date.now() / 1000 - a.last_tick_ts).toFixed(1)}s ago`
-            : "—";
+        const idle = a.last_tick_ts > 0
+          ? `${(Date.now() / 1000 - a.last_tick_ts).toFixed(1)}s ago`
+          : "—";
         metaEl.textContent =
           `${a.closed_count} bars · ${a.ticks} ticks · last ${idle}`;
       }
@@ -172,6 +187,7 @@ async function tick() {
 
   } catch (e) {
     setStatus("err", `CLIENT: ${e.message}`);
+    setDiag(`fetch failed: ${e.message}`);
   }
 }
 
