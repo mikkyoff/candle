@@ -2,21 +2,17 @@
 Multi-asset 10s candle builder for bandwidth comparison.
 
 Three assets on one client, three tick subscriptions, three independent
-candle builders. No seeding — 10s bars don't exist server-side and split
-bars from 60s would produce fake bandwidth readings.
+candle builders. No seeding — 10s bars don't exist server-side.
 
-What "bandwidth" means here:
+The library's subscribe_symbol() emits the server's *in-progress candle*
+on every price change, not a raw price tick. Shape:
 
-    bandwidth % = (upper - lower) / middle * 100
+    {'symbol': 'EURUSD_otc', 'timestamp': 1791780799,
+     'open': '1.09908', 'high': '1.09908', 'low': '1.09908',
+     'close': '1.09908', 'volume': None, 'is_closed': False}
 
-where upper/middle/lower are the Bollinger Bands (20-period, 2σ) over the
-asset's recent 10s closes. It's the width of the band as a percentage of
-the middle band — a normalised volatility measure. Because it's a
-percentage, it's directly comparable across assets with very different
-price scales (EURUSD ~1.08 vs EURGBP ~0.85 vs AUDUSD ~0.66).
-
-The chart shows one line per asset on a single pane, all three on the
-same axis, so you can see which is ranging wider right now.
+So we treat `close` as the current price and `timestamp` as the tick
+time, then bucket into 10s candles ourselves.
 """
 
 import asyncio
@@ -37,13 +33,14 @@ BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
 BB_STD = float(os.getenv("BB_STD", "2.0"))
 SSID = os.getenv("POCKET_OPTION_SSID")
 
-# One state dict per asset.
 _state = {
     asset: {
         "candles": [],
         "forming": None,
         "ticks": 0,
         "last_tick_ts": 0.0,
+        "sample": None,          # last raw tick, for debugging
+        "sub_error": None,
     }
     for asset in ASSETS
 }
@@ -52,6 +49,7 @@ _conn = {
     "connected": False,
     "error": None,
     "started_at": time.time(),
+    "snapshots": 0,
 }
 _lock = threading.Lock()
 
@@ -83,10 +81,6 @@ def _bucket(ts):
 
 
 def _ingest_tick(asset, ts, price):
-    """
-    Fold a tick into the asset's current 10s bucket.
-    Called under _lock.
-    """
     st = _state[asset]
     bucket = _bucket(ts)
     forming = st["forming"]
@@ -120,16 +114,11 @@ def _ingest_tick(asset, ts, price):
         }
         return
 
-    # Late tick for a closed bucket — drop.
-    return
 
-
-def _bollinger(closes, period=BB_PERIOD, mult=BB_STD):
-    if len(closes) < period:
-        return None, None, None
-    window = closes[-period:]
-    mean = sum(window) / period
-    variance = sum((x - mean) ** 2 for x in window) / period
+def _bollinger_window(window, mult=BB_STD):
+    n = len(window)
+    mean = sum(window) / n
+    variance = sum((x - mean) ** 2 for x in window) / n
     sd = variance ** 0.5
     return mean + mult * sd, mean, mean - mult * sd
 
@@ -142,10 +131,30 @@ def _bandwidth_pct(upper, middle, lower):
     return (upper - lower) / middle * 100.0
 
 
+def _build_bandwidth_series(display, period, mult):
+    """
+    Compute the bandwidth series in one pass.
+
+    For each index i where we have `period` closes, compute BB over
+    closes[i-period+1 .. i] and emit a point at display[i]['time'].
+    O(N * period) — much cheaper than the previous O(N^2).
+    """
+    if len(display) < period:
+        return []
+
+    closes = [c["close"] for c in display]
+    out = []
+    for i in range(period - 1, len(closes)):
+        window = closes[i - period + 1 : i + 1]
+        u, m, l = _bollinger_window(window, mult)
+        b = _bandwidth_pct(u, m, l)
+        if b is None:
+            continue
+        out.append({"time": display[i]["time"], "value": round(b, 6)})
+    return out
+
+
 async def _stream_asset(client, asset):
-    """
-    Independent tick consumer per asset. Runs forever until cancelled.
-    """
     retry_delay = 1.0
 
     while not _stop.is_set():
@@ -153,15 +162,13 @@ async def _stream_asset(client, asset):
             stream = await client.subscribe_symbol(asset)
             print(f"[{asset}] subscribed", flush=True)
 
-            sample_logged = 0
-
             async for tick in stream:
                 if _stop.is_set():
                     break
 
-                if sample_logged < 3:
-                    print(f"[{asset}] tick sample: {tick!r}", flush=True)
-                    sample_logged += 1
+                with _lock:
+                    if _state[asset]["sample"] is None:
+                        _state[asset]["sample"] = tick
 
                 try:
                     ts, price = _extract_tick(tick)
@@ -183,6 +190,10 @@ async def _stream_asset(client, asset):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            with _lock:
+                _state[asset]["sub_error"] = (
+                    f"{type(e).__name__}: {e}"
+                )
             print(
                 f"[{asset}] stream error {type(e).__name__}: {e}",
                 flush=True,
@@ -200,8 +211,7 @@ async def _stream():
 
     if len(ASSETS) > 4:
         raise RuntimeError(
-            f"{len(ASSETS)} assets requested; the library supports at "
-            f"most 4 concurrent subscriptions per client"
+            f"{len(ASSETS)} assets requested; max is 4 per client"
         )
 
     config = Config(
@@ -219,8 +229,7 @@ async def _stream():
         _conn["error"] = None
 
     tasks = [
-        asyncio.create_task(_stream_asset(client, a))
-        for a in ASSETS
+        asyncio.create_task(_stream_asset(client, a)) for a in ASSETS
     ]
 
     try:
@@ -265,12 +274,8 @@ def start():
 
 
 def snapshot():
-    """
-    Emit one series per asset, each with:
-      - bandwidth_pct over closed+forming closes
-      - current numeric readings (rsi/ema/bb) for the side panel
-    """
     with _lock:
+        _conn["snapshots"] += 1
         now = time.time()
         assets_out = []
 
@@ -281,22 +286,16 @@ def snapshot():
             display = closed + ([forming] if forming else [])
             closes = [c["close"] for c in display]
 
-            upper, middle, lower = _bollinger(closes)
-            bw = _bandwidth_pct(upper, middle, lower)
-
-            # Build a full bandwidth series by walking the closes,
-            # computing BB at each step once enough history exists.
-            bw_series = []
             if len(closes) >= BB_PERIOD:
-                for i in range(BB_PERIOD - 1, len(closes)):
-                    sub = closes[: i + 1]
-                    u, m, l = _bollinger(sub)
-                    b = _bandwidth_pct(u, m, l)
-                    if b is None:
-                        continue
-                    bw_series.append(
-                        {"time": display[i]["time"], "value": round(b, 6)}
-                    )
+                window = closes[-BB_PERIOD:]
+                upper, middle, lower = _bollinger_window(window)
+            else:
+                upper = middle = lower = None
+
+            bw = _bandwidth_pct(upper, middle, lower)
+            bw_series = _build_bandwidth_series(
+                display, BB_PERIOD, BB_STD
+            )
 
             assets_out.append(
                 {
@@ -313,8 +312,18 @@ def snapshot():
                     "bb_middle": middle,
                     "bb_lower": lower,
                     "bandwidth_series": bw_series,
+                    "sub_error": st["sub_error"],
                 }
             )
+
+        ages = [
+            _state[a]["last_tick_ts"]
+            for a in ASSETS
+            if _state[a]["last_tick_ts"] > 0
+        ]
+        last_age = (
+            round(now - max(ages), 2) if ages else None
+        )
 
         return {
             "assets": assets_out,
@@ -323,12 +332,7 @@ def snapshot():
             "bb_std": BB_STD,
             "connected": _conn["connected"],
             "error": _conn["error"],
-            "last_tick_age_s": round(
-                now - max(
-                    (_state[a]["last_tick_ts"] for a in ASSETS),
-                    default=0.0,
-                ),
-                2,
-            ),
+            "last_tick_age_s": last_age,
             "uptime_s": round(now - _conn["started_at"], 1),
+            "snapshots": _conn["snapshots"],
         }
