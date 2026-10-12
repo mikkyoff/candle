@@ -1,18 +1,17 @@
 """
-Multi-asset 10s candle builder for bandwidth comparison.
+Multi-asset 10s candle builder.
 
 Three assets on one client, three tick subscriptions, three independent
-candle builders. No seeding — 10s bars don't exist server-side.
+candle builders.
 
-The library's subscribe_symbol() emits the server's *in-progress candle*
-on every price change, not a raw price tick. Shape:
+The library emits the server's in-progress candle on every price change:
 
     {'symbol': 'EURUSD_otc', 'timestamp': 1791780799,
      'open': '1.09908', 'high': '1.09908', 'low': '1.09908',
      'close': '1.09908', 'volume': None, 'is_closed': False}
 
-So we treat `close` as the current price and `timestamp` as the tick
-time, then bucket into 10s candles ourselves.
+We read `close` as the current price and `timestamp` as tick time, then
+bucket into 10s candles ourselves.
 """
 
 import asyncio
@@ -39,7 +38,6 @@ _state = {
         "forming": None,
         "ticks": 0,
         "last_tick_ts": 0.0,
-        "sample": None,          # last raw tick, for debugging
         "sub_error": None,
     }
     for asset in ASSETS
@@ -49,7 +47,6 @@ _conn = {
     "connected": False,
     "error": None,
     "started_at": time.time(),
-    "snapshots": 0,
 }
 _lock = threading.Lock()
 
@@ -115,7 +112,7 @@ def _ingest_tick(asset, ts, price):
         return
 
 
-def _bollinger_window(window, mult=BB_STD):
+def _bollinger(window, mult=BB_STD):
     n = len(window)
     mean = sum(window) / n
     variance = sum((x - mean) ** 2 for x in window) / n
@@ -123,21 +120,10 @@ def _bollinger_window(window, mult=BB_STD):
     return mean + mult * sd, mean, mean - mult * sd
 
 
-def _bandwidth_pct(upper, middle, lower):
-    if upper is None or middle is None or lower is None:
-        return None
-    if middle == 0:
-        return None
-    return (upper - lower) / middle * 100.0
-
-
-def _build_bandwidth_series(display, period, mult):
+def _bandwidth_series(display, period, mult):
     """
-    Compute the bandwidth series in one pass.
-
-    For each index i where we have `period` closes, compute BB over
-    closes[i-period+1 .. i] and emit a point at display[i]['time'].
-    O(N * period) — much cheaper than the previous O(N^2).
+    One BB-bandwidth point per candle, aligned to that candle's time.
+    Only emitted once `period` closes exist.
     """
     if len(display) < period:
         return []
@@ -146,11 +132,11 @@ def _build_bandwidth_series(display, period, mult):
     out = []
     for i in range(period - 1, len(closes)):
         window = closes[i - period + 1 : i + 1]
-        u, m, l = _bollinger_window(window, mult)
-        b = _bandwidth_pct(u, m, l)
-        if b is None:
+        u, m, l = _bollinger(window, mult)
+        if m == 0:
             continue
-        out.append({"time": display[i]["time"], "value": round(b, 6)})
+        bw = (u - l) / m * 100.0
+        out.append({"time": display[i]["time"], "value": round(bw, 6)})
     return out
 
 
@@ -166,17 +152,9 @@ async def _stream_asset(client, asset):
                 if _stop.is_set():
                     break
 
-                with _lock:
-                    if _state[asset]["sample"] is None:
-                        _state[asset]["sample"] = tick
-
                 try:
                     ts, price = _extract_tick(tick)
-                except Exception as e:
-                    print(
-                        f"[{asset}] tick skip {type(e).__name__}: {e}",
-                        flush=True,
-                    )
+                except Exception:
                     continue
 
                 with _lock:
@@ -194,10 +172,7 @@ async def _stream_asset(client, asset):
                 _state[asset]["sub_error"] = (
                     f"{type(e).__name__}: {e}"
                 )
-            print(
-                f"[{asset}] stream error {type(e).__name__}: {e}",
-                flush=True,
-            )
+            print(f"[{asset}] stream error: {e}", flush=True)
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 30.0)
 
@@ -275,7 +250,6 @@ def start():
 
 def snapshot():
     with _lock:
-        _conn["snapshots"] += 1
         now = time.time()
         assets_out = []
 
@@ -286,31 +260,20 @@ def snapshot():
             display = closed + ([forming] if forming else [])
             closes = [c["close"] for c in display]
 
-            if len(closes) >= BB_PERIOD:
-                window = closes[-BB_PERIOD:]
-                upper, middle, lower = _bollinger_window(window)
-            else:
-                upper = middle = lower = None
-
-            bw = _bandwidth_pct(upper, middle, lower)
-            bw_series = _build_bandwidth_series(
-                display, BB_PERIOD, BB_STD
+            bw_series = _bandwidth_series(display, BB_PERIOD, BB_STD)
+            current_bw = (
+                bw_series[-1]["value"] if bw_series else None
             )
 
             assets_out.append(
                 {
                     "asset": asset,
-                    "candles": display,
+                    "candles": display,          # <-- full OHLC, charted
                     "closed_count": len(closed),
                     "forming": forming,
                     "ticks": st["ticks"],
                     "last_tick_ts": st["last_tick_ts"],
-                    "bandwidth_pct": (
-                        round(bw, 6) if bw is not None else None
-                    ),
-                    "bb_upper": upper,
-                    "bb_middle": middle,
-                    "bb_lower": lower,
+                    "bandwidth_pct": current_bw,
                     "bandwidth_series": bw_series,
                     "sub_error": st["sub_error"],
                 }
@@ -321,9 +284,7 @@ def snapshot():
             for a in ASSETS
             if _state[a]["last_tick_ts"] > 0
         ]
-        last_age = (
-            round(now - max(ages), 2) if ages else None
-        )
+        last_age = round(now - max(ages), 2) if ages else None
 
         return {
             "assets": assets_out,
@@ -334,5 +295,4 @@ def snapshot():
             "error": _conn["error"],
             "last_tick_age_s": last_age,
             "uptime_s": round(now - _conn["started_at"], 1),
-            "snapshots": _conn["snapshots"],
         }
