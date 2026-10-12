@@ -22,11 +22,10 @@ def index():
 def state():
     snap = server.snapshot()
     any_ticks = any(a["ticks"] > 0 for a in snap["assets"])
-    if snap["error"] and not any_ticks:
-        return jsonify(snap), 503
-    if not any_ticks:
-        return jsonify(snap), 503
-    return jsonify(snap)
+    # Always 200 so the frontend can render diagnostics in every state.
+    # The frontend decides what to show based on `error` and `ticks`.
+    status = 200 if any_ticks else 202
+    return jsonify(snap), status
 
 
 @app.route("/api/debug/state")
