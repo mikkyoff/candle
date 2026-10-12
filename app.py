@@ -18,15 +18,14 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/api/candles")
-def candles():
+@app.route("/api/state")
+def state():
     snap = server.snapshot()
-
-    if snap["error"] and not snap["candles"] and not snap["forming"]:
+    any_ticks = any(a["ticks"] > 0 for a in snap["assets"])
+    if snap["error"] and not any_ticks:
         return jsonify(snap), 503
-    if not snap["candles"] and not snap["forming"]:
+    if not any_ticks:
         return jsonify(snap), 503
-
     return jsonify(snap)
 
 
