@@ -26,7 +26,7 @@ ASSETS = [
     ).split(",")
     if a.strip()
 ]
-TIMEFRAME = int(os.getenv("TIMEFRAME", "10"))
+TIMEFRAME = int(os.getenv("TIMEFRAME", "60"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
 BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
 BB_STD = float(os.getenv("BB_STD", "2.0"))
